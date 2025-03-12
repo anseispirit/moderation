@@ -1,0 +1,290 @@
+const { Client, GatewayIntentBits, EmbedBuilder, SlashCommandBuilder, ChannelType } = require('discord.js');
+const { token } = require('./config.json');
+const memberLogChannelID = '1325141735080333343'; // Channel ID for member join/leave logs
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers,
+  ],
+  partials: ['MESSAGE', 'CHANNEL', 'REACTION'],
+});
+
+const userLogChannelID = '1322814000328609837'; // Channel ID for user message delete/edit logs
+const automodLogChannelID = '1322814000328609840'; // Channel ID for auto-mod deleted message logs
+const allowedRoles = ['Owner', 'Helper', 'Staff', 'Bot']; // Whitelisted roles for automod
+const logAllowedRoles = ['Owner', 'Bot']; // Whitelisted roles for logging
+
+// In-memory storage for stats (Can be replaced with a database)
+const statsDatabase = {
+  totalMessages: 0,
+  totalVCTime: 0, // In minutes
+  monthlyMessages: 0,
+  monthlyVCTime: 0,
+  dailyMessages: 0,
+  dailyVCTime: 0,
+  users: {}, // Store user-specific stats
+};
+
+client.once('ready', async () => {
+  console.log(`${client.user.tag} is online!`);
+  await fetchServerMessages();
+  registerCommands();
+});
+
+// Fetching all messages from all text channels in the server
+async function fetchServerMessages() {
+  const guild = client.guilds.cache.get('1322814000232403016'); // Your server ID
+  if (!guild) {
+    console.error("Guild not found");
+    return;
+  }
+
+  console.log("Fetching old messages from all channels...");
+
+  let totalFetched = 0;
+
+  // Get all channels where messages can be fetched
+  const textChannels = guild.channels.cache.filter(
+    (channel) => 
+      channel.type === ChannelType.GuildText || 
+      channel.type === ChannelType.GuildAnnouncement
+  );
+
+  for (const [channelID, channel] of textChannels) {
+    let lastMessageId = null;
+    let hasMoreMessages = true;
+
+    while (hasMoreMessages) {
+      try {
+        // Fetch 100 messages at a time
+        const options = lastMessageId ? { before: lastMessageId, limit: 100 } : { limit: 100 };
+        const messages = await channel.messages.fetch(options);
+
+        if (messages.size === 0) {
+          hasMoreMessages = false;
+        } else {
+          messages.forEach(message => {
+            // Update server-wide message count
+            statsDatabase.totalMessages++;
+            statsDatabase.dailyMessages++;
+
+            // Update user-specific stats
+            if (!statsDatabase.users[message.author.id]) {
+              statsDatabase.users[message.author.id] = { messages: 0, vcTime: 0 };
+            }
+            statsDatabase.users[message.author.id].messages++;
+          });
+
+          // Set lastMessageId for pagination
+          lastMessageId = messages.last().id;
+          totalFetched += messages.size;
+        }
+      } catch (error) {
+        console.error(`Error fetching messages from #${channel.name}:`, error);
+        hasMoreMessages = false; // Stop fetching for this channel if error occurs
+      }
+    }
+  }
+
+  console.log(`✅ Finished fetching ${totalFetched} old messages across all channels.`);
+  
+}
+
+// Registering commands
+async function registerCommands() {
+  const guild = client.guilds.cache.get('1322814000232403016'); // replace with your guild ID
+
+  if (!guild) {
+    console.error("Guild not found");
+    return;
+  }
+
+  const commands = [
+    new SlashCommandBuilder()
+      .setName('stats')
+      .setDescription('Shows the server stats: messages sent, VC time, etc.'),
+    new SlashCommandBuilder()
+      .setName('mstats')
+      .setDescription('Shows stats for a specific user.')
+      .addUserOption(option => option.setName('user').setDescription('The user to view stats for').setRequired(true)),
+  ];
+
+  try {
+    await guild.commands.set(commands); // Register the commands with Discord
+    console.log("Commands registered!");
+  } catch (error) {
+    console.error("Error registering commands: ", error);
+  }
+}
+
+// Member Join Event
+client.on('guildMemberAdd', async (member) => {
+  const greetingMessage = `Hi ${member.user.username},  welcome to the server! Were still growing so were happy to have you <3`;
+  
+  try {
+    await member.send(greetingMessage);
+  } catch (error) {
+    console.error(`Could not send DM to ${member.user.tag}. Error: ${error.message}`);
+  }
+
+  const joinPosition = member.guild.memberCount;
+  const accountAge = Math.floor((Date.now() - member.user.createdAt) / (1000 * 60 * 60 * 24)); // In days
+  
+  const embed = new EmbedBuilder()
+    .setTitle('Member Joined')
+    .setDescription(`${member.user} has joined the server.`)
+    .setThumbnail(member.user.displayAvatarURL())
+    .addFields(
+      { name: 'Member Number', value: `${joinPosition}`, inline: true },
+      { name: 'Account Age', value: `${accountAge} days old`, inline: true }
+    )
+    .setColor('Green');
+
+  const logChannel = await client.channels.fetch(memberLogChannelID);
+  logChannel?.send({ embeds: [embed] });
+});
+
+// Member Leave Event
+client.on('guildMemberRemove', async (member) => {
+  const joinedAgo = member.joinedAt ? Math.floor((Date.now() - member.joinedAt) / (1000 * 60 * 60 * 24)) : 'Unknown';
+  const roles = member.roles.cache.filter(role => role.name !== '@everyone').map(role => role.name).join(', ') || 'None';
+  
+  const embed = new EmbedBuilder()
+    .setTitle('Member Left')
+    .setDescription(`${member.user.toString()} has left the server.`)
+    .setThumbnail(member.user.displayAvatarURL())
+    .addFields(
+      { name: 'Joined Ago', value: `${joinedAgo} days ago`, inline: true },
+      { name: 'Roles', value: roles, inline: false }
+    )
+    .setColor('Red');
+  
+  const logChannel = await client.channels.fetch(memberLogChannelID);
+  logChannel?.send({ embeds: [embed] });
+});
+
+// Message Create Event (Stats Update)
+client.on('messageCreate', async (message) => {
+  if (message.author.bot) return;
+
+  // Update total messages and daily messages
+  statsDatabase.totalMessages++;
+  statsDatabase.dailyMessages++;
+
+  // Check if the message was sent in a voice channel (for VC time)
+  if (message.content.toLowerCase().includes('voice')) { // For demo, replace with actual VC tracking logic
+    statsDatabase.totalVCTime += 5; // Assume 5 minutes for the demonstration
+    statsDatabase.dailyVCTime += 5;
+  }
+
+  const userRoles = message.member.roles.cache.map(role => role.name);
+  const isWhitelisted = allowedRoles.some(role => userRoles.includes(role));
+
+  const forbiddenKeywords = ['discord.gg'];
+  if (!isWhitelisted && forbiddenKeywords.some(keyword => message.content.toLowerCase().includes(keyword))) {
+    await message.delete();  // Delete the message
+
+    const logChannel = await client.channels.fetch(automodLogChannelID);
+    const embed = new EmbedBuilder()
+      .setTitle('Message Deleted (Auto-delete)')
+      .setColor('#FF0000')
+      .addFields(
+        { name: 'User', value: message.author.tag, inline: true },
+        { name: 'Message', value: message.content || 'No content', inline: true },
+        { name: 'Channel', value: message.channel.name, inline: true },
+        { name: 'Reason', value: 'Contains forbidden keywords: https, discord.gg', inline: false },
+        { name: 'Time', value: new Date().toLocaleString(), inline: true }
+      )
+      .setTimestamp();
+
+    logChannel.send({ embeds: [embed] });
+  }
+});
+
+// Message Delete Log (user messages)
+client.on('messageDelete', async (deletedMessage) => {
+  console.log(`Message deleted: ${deletedMessage.content}`);
+  const restrictedRoles = ["Owner", "Staff", "Bot"];
+const member = await deletedMessage.guild.members.fetch(deletedMessage.author.id).catch(() => null);
+
+if (member && member.roles.cache.some(role => restrictedRoles.includes(role.name))) {
+  return; // Stop execution if the user has a restricted role
+}
+
+
+  const logChannel = await client.channels.fetch(userLogChannelID).catch(console.error);
+
+  const embed = new EmbedBuilder()
+    .setTitle('Message Deleted')
+    .setColor('#FF0000')
+    .addFields(
+      { name: 'User', value: deletedMessage.author.tag, inline: true },
+      { name: 'Message', value: deletedMessage.content || 'No content' },
+      { name: 'Channel', value: deletedMessage.channel.name, inline: true },
+      { name: 'Time', value: new Date().toLocaleString(), inline: true }
+    )
+    .setTimestamp();
+
+  logChannel.send({ embeds: [embed] });
+});
+
+// Message Edit Log (user messages)
+client.on('messageUpdate', async (oldMessage, newMessage) => {
+  if (oldMessage.partial || newMessage.partial) return;
+
+  if (oldMessage.content !== newMessage.content) {
+    const logChannel = await client.channels.fetch(userLogChannelID);
+
+    const embed = new EmbedBuilder()
+      .setTitle('Message Edited')
+      .setColor('#FFA500')
+      .addFields(
+        { name: 'User', value: newMessage.author.tag, inline: true },
+        { name: 'Old Message', value: oldMessage.content || 'No content', inline: true },
+        { name: 'New Message', value: newMessage.content || 'No content', inline: true },
+        { name: 'Channel', value: newMessage.channel.name, inline: true },
+        { name: 'Time', value: new Date().toLocaleString(), inline: true }
+      )
+      .setTimestamp();
+
+    logChannel.send({ embeds: [embed] });
+  }
+});
+
+// Handle Stats Commands
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isCommand()) return;
+
+  const { commandName } = interaction;
+
+  if (commandName === 'stats') {
+    const statsEmbed = new EmbedBuilder()
+      .setTitle('Server Stats')
+      .setColor('#00FF00')
+      .addFields(
+        { name: 'Total Messages', value: statsDatabase.totalMessages.toString(), inline: true },
+        { name: 'Daily Messages', value: statsDatabase.dailyMessages.toString(), inline: true },
+        { name: 'Total VC Time', value: `${statsDatabase.totalVCTime} mins`, inline: true },
+        { name: 'Daily VC Time', value: `${statsDatabase.dailyVCTime} mins`, inline: true }
+      );
+    await interaction.reply({ embeds: [statsEmbed] });
+  } else if (commandName === 'mstats') {
+    const user = interaction.options.getUser('user');
+    const userStats = statsDatabase.users[user.id] || { messages: 0, vcTime: 0 };
+
+    const userStatsEmbed = new EmbedBuilder()
+      .setTitle(`${user.username}'s Stats`)
+      .setColor('#00BFFF')
+      .addFields(
+        { name: 'Messages Sent', value: userStats.messages.toString(), inline: true },
+        { name: 'VC Time', value: `${userStats.vcTime} mins`, inline: true }
+      );
+
+    await interaction.reply({ embeds: [userStatsEmbed] });
+  }
+});
+
+client.login(token);
