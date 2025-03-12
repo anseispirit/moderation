@@ -1,0 +1,209 @@
+const { Client, GatewayIntentBits, GuildMembers } = require('discord.js');
+require('dotenv').config(); // Load environment variables from .env file
+const { EmbedBuilder } = require('discord.js');
+const fs = require('fs'); // Add the file system module to write to files
+
+// Load Discord token from config.json
+const config = require('./config.json');
+
+// Create a new Discord client instance
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+});
+
+const triviaChannelId = '1322814000970334318';  // Trivia channel ID
+
+let messageCount = 0; // Message counter for trivia questions
+let triviaLock = false; // Lock to prevent multiple answers at the same time
+let triviaTimeout; // Store the timeout for answering
+let lastTriviaQuestion = null; // Keep track of the last question asked
+
+// Load correct answers from a JSON file (if exists)
+let correctAnswers = {}; // Object to track correct answers per user
+if (fs.existsSync('correctAnswers.json')) {
+  correctAnswers = JSON.parse(fs.readFileSync('correctAnswers.json'));
+}
+
+// Function to save correct answers to the file
+const saveCorrectAnswers = () => {
+  fs.writeFileSync('correctAnswers.json', JSON.stringify(correctAnswers, null, 2));
+};
+
+// Trivia questions and their correct answers
+const triviaQuestions = [
+  { question: "What is the capital of France?", correctAnswer: "Paris" },
+  { question: "Which planet is known as the Red Planet?", correctAnswer: "Mars" },
+  { question: "Who wrote 'Romeo and Juliet'?", correctAnswer: "William Shakespeare" },
+  { question: "What is the largest mammal in the world?", correctAnswer: "Blue Whale" },
+  { question: "Who painted the Mona Lisa?", correctAnswer: "Leonardo da Vinci" },
+  { question: "What year did the Titanic sink?", correctAnswer: "1912" },
+  { question: "What is the boiling point of water in Celsius?", correctAnswer: "100" },
+  { question: "Which animal is the largest living land mammal?", correctAnswer: "Elephant" },
+  { question: "What is the hardest natural substance on Earth?", correctAnswer: "Diamond" },
+  { question: "Which element has the chemical symbol O?", correctAnswer: "Oxygen" },
+  { question: "In which country would you find the Great Barrier Reef?", correctAnswer: "Australia" },
+  { question: "What is the longest river in the world?", correctAnswer: "Nile" },
+  { question: "What is the currency of Japan?", correctAnswer: "Yen" },
+  { question: "Which famous scientist developed the theory of relativity?", correctAnswer: "Albert Einstein" },
+  { question: "What is the capital city of Canada?", correctAnswer: "Ottawa" },
+  { question: "Which bird is known for its ability to mimic human speech?", correctAnswer: "Parrot" },
+  { question: "Who was the first person to set foot on the Moon?", correctAnswer: "Neil Armstrong" },
+  { question: "Which element is represented by the symbol 'Na'?", correctAnswer: "Sodium" },
+  { question: "What is the largest island in the world?", correctAnswer: "Greenland" },
+  { question: "In what year did World War I begin?", correctAnswer: "1914" },
+  { question: "Who invented the telephone?", correctAnswer: "Alexander Graham Bell" },
+  { question: "What is the smallest planet in our solar system?", correctAnswer: "Mercury" },
+  { question: "Which country is known as the Land of the Rising Sun?", correctAnswer: "Japan" },
+  { question: "What is the national flower of Japan?", correctAnswer: "Cherry Blossom" },
+  { question: "Which popular video game franchise features a plumber named Mario?", correctAnswer: "Super Mario" },
+  { question: "What is the capital of the United States?", correctAnswer: "Washington" },
+  { question: "Who painted the Sistine Chapel ceiling?", correctAnswer: "Michelangelo" },
+  { question: "Which animal is known as the king of the jungle?", correctAnswer: "Lion" },
+  { question: "What is the largest desert in the world?", correctAnswer: "Sahara" },
+  { question: "In what country is the Great Wall of China located?", correctAnswer: "China" },
+  { question: "What is the main ingredient in guacamole?", correctAnswer: "Avocado" },
+  { question: "Which ocean is the largest in the world?", correctAnswer: "Pacific" },
+  { question: "What is the main gas found in Earth's atmosphere?", correctAnswer: "Nitrogen" },
+  { question: "What is the official language of Brazil?", correctAnswer: "Portuguese" },
+  { question: "Who wrote the novel '1984'?", correctAnswer: "George Orwell" },
+  { question: "Which planet is the largest in our solar system?", correctAnswer: "Jupiter" },
+  { question: "Who discovered penicillin?", correctAnswer: "Alexander Fleming" },
+  { question: "What is the chemical symbol for gold?", correctAnswer: "Au" },
+  { question: "What type of animal is the largest living species of reptile?", correctAnswer: "Crocodile" },
+  { question: "Which country invented pizza?", correctAnswer: "Italy" },
+  { question: "Which famous actor played Jack Dawson in the movie Titanic?", correctAnswer: "Leonardo DiCaprio" },
+  { question: "What is the longest running animated TV show in the U.S.?", correctAnswer: "The Simpsons" },
+  { question: "What is the name of Harry Potter's owl?", correctAnswer: "Hedwig" },
+  { question: "What is the world's most popular sport?", correctAnswer: "Soccer" },
+  { question: "What is the smallest bone in the human body?", correctAnswer: "Stapes" },
+  { question: "Which planet is closest to the Sun?", correctAnswer: "Mercury" },
+  { question: "In which country was the first modern Olympic Games held?", correctAnswer: "Greece" },
+  { question: "What does the acronym 'NASA' stand for?", correctAnswer: "National Aeronautics and Space Administration" },
+  { question: "Who was the first woman to fly solo across the Atlantic?", correctAnswer: "Amelia Earhart" },
+  { question: "What is the longest running TV show in the U.S.?", correctAnswer: "The Simpsons" },
+  { question: "What is the largest organ in the human body?", correctAnswer: "Skin" },
+  { question: "What is the most common blood type?", correctAnswer: "O+" },
+  { question: "Which element has the highest atomic number?", correctAnswer: "Oganesson" },
+  { question: "What is the largest planet in our solar system?", correctAnswer: "Jupiter" },
+  { question: "Who is known as the father of modern physics?", correctAnswer: "Albert Einstein" },
+  { question: "What is the capital city of Italy?", correctAnswer: "Rome" },
+  { question: "Which country is home to the ancient city of Petra?", correctAnswer: "Jordan" },
+  { question: "What does the word 'kangaroo' mean in the language of the Guugu Yimithirr?", correctAnswer: "I don't know" },
+  { question: "Which element is commonly used to make light bulbs?", correctAnswer: "Tungsten" },
+  { question: "What is the official language of Canada?", correctAnswer: "English and French" },
+  { question: "What year was the first iPhone released?", correctAnswer: "2007" },
+  { question: "Which country is known for the Eiffel Tower?", correctAnswer: "France" },
+  { question: "Who was the first president of the United States?", correctAnswer: "George Washington" },
+  { question: "What is the most common element in Earth's crust?", correctAnswer: "Oxygen" },
+  { question: "In what year did World War II end?", correctAnswer: "1945" },
+  { question: "Which human organ can regenerate itself?", correctAnswer: "Liver" },
+  { question: "What does DNA stand for?", correctAnswer: "Deoxyribonucleic Acid" },
+  { question: "Which country is known for the pyramids?", correctAnswer: "Egypt" },
+  { question: "Which animal is famous for having a long neck?", correctAnswer: "Giraffe" },
+  { question: "Which chemical element has the atomic number 79?", correctAnswer: "Gold" },
+  { question: "Who developed the first successful airplane?", correctAnswer: "Wright brothers" }
+];
+
+// Function to pick a random trivia question
+const getRandomQuestion = () => {
+  let randomQuestion;
+  do {
+    randomQuestion = triviaQuestions[Math.floor(Math.random() * triviaQuestions.length)];
+  } while (randomQuestion === lastTriviaQuestion); // Ensure it doesn't repeat the last question
+  lastTriviaQuestion = randomQuestion;
+  return randomQuestion;
+};
+
+// Function to ask a trivia question every 100 messages
+const askTrivia = () => {
+  if (triviaLock) return; // Prevent asking a new question if one is already active
+
+  const triviaChannel = client.channels.cache.get(triviaChannelId);
+  if (triviaChannel) {
+    const triviaQuestion = getRandomQuestion();
+    triviaChannel.send(triviaQuestion.question);
+    triviaLock = true; // Lock the trivia question
+
+    // Store the current question
+    lastTriviaQuestion = triviaQuestion;
+
+    // Set a timeout to unlock the trivia after 30 seconds if no correct answer
+    triviaTimeout = setTimeout(() => {
+      triviaLock = false; // Unlock trivia for the next round
+    }, 30000); // 30-second timeout
+  }
+};
+
+// Event when the bot is ready
+client.once('ready', () => {
+  console.log('Bot is online!');
+});
+
+// Event when a message is received
+client.on('messageCreate', async message => {
+  if (message.author.bot) return;
+
+  // Increment message count
+  messageCount++;
+
+  // Check if 100 messages have been sent and no trivia is active
+  if (messageCount >= 100 && !triviaLock) {
+    askTrivia();
+    messageCount = 0; // Reset the message count
+  }
+
+  // Check for trivia answer
+  if (triviaLock && lastTriviaQuestion) {
+    const answer = message.content.trim();
+    
+    if (answer.toLowerCase() === lastTriviaQuestion.correctAnswer.toLowerCase()) {
+      const userId = message.author.id;
+
+      // Update the correct answers count
+      correctAnswers[userId] = (correctAnswers[userId] || 0) + 1;
+
+      // Save the updated answers count to the file
+      saveCorrectAnswers();
+
+      message.reply(`Correct! Your current score: ${correctAnswers[userId]} correct answers.`);
+
+      triviaLock = false; // Unlock for the next question
+      clearTimeout(triviaTimeout); // Prevent timeout from unlocking trivia
+    }
+  }
+
+  const command = message.content.toLowerCase().split(' ')[0];
+
+if (message.content.toLowerCase() === '!leaderboards') {
+    // Sort the users by the number of correct answers
+    const sortedUsers = Object.entries(correctAnswers)
+      .sort((a, b) => b[1] - a[1]);  // Sort by correct answers in descending order
+
+    // Create an embed for the leaderboard
+    const leaderboardEmbed = new EmbedBuilder()
+      .setTitle('Leaderboard')
+      .setDescription('Here are the top players with the most correct answers!')
+      .setColor('#0099ff');
+
+    // Add the top 10 users to the embed
+    for (let i = 0; i < Math.min(sortedUsers.length, 10); i++) {
+      const [userId, score] = sortedUsers[i];
+      try {
+        const user = await client.users.fetch(userId);  // Fetch the user by ID
+        leaderboardEmbed.addFields({
+          name: `${i + 1}. ${user.tag}`,
+          value: `${score} correct answers`,
+          inline: false
+        });
+      } catch (err) {
+        console.error(`Could not fetch user with ID ${userId}: ${err}`);
+      }
+    }
+
+    // Send the embed to the channel
+    message.channel.send({ embeds: [leaderboardEmbed] });
+  }
+});
+
+// Log in to Discord with the app's token
+client.login(config.token);
