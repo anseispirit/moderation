@@ -1,0 +1,674 @@
+const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const fs = require('fs');
+
+// Load the bot token from config.json
+const config = JSON.parse(fs.readFileSync('config.json'));
+const token = config.token;
+
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers, GatewayIntentBits.DirectMessages] });
+
+const creditsFile = 'credits.json';
+let creditsData = fs.existsSync(creditsFile) ? JSON.parse(fs.readFileSync(creditsFile)) : {};
+let spinCooldowns = {};
+
+// Function to format numbers with commas, including negative numbers
+function formatCredits(credits) {
+    return credits.toLocaleString();
+}
+
+// Save credits data to file
+function saveCredits() {
+    fs.writeFileSync(creditsFile, JSON.stringify(creditsData, null, 2));
+}
+
+// Generate the economy report
+function generateEconomyReport() {
+  let totalCredits = 0;
+  let totalDebt = 0;
+  let leaderboard = [];
+
+  // Calculate total credits and debt, and prepare leaderboard
+  for (const [userId, userData] of Object.entries(creditsData)) {
+      let userCredits = userData.credits || 0;
+
+      // Exclude infinity from total credits but keep it for leaderboard display
+      if (userCredits === Infinity || userCredits === -Infinity) {
+          leaderboard.push({ userId, credits: userCredits }); // Keep it in the leaderboard
+          continue; // Skip adding to total credits or debt
+      }
+
+      // Only add positive credits to totalCredits and negative to totalDebt
+      if (userCredits > 0) {
+          totalCredits += userCredits;
+      } else {
+          totalDebt += userCredits;  // This will be negative or zero, representing debt
+      }
+      
+      leaderboard.push({ userId, credits: userCredits });
+  }
+
+  // Sort leaderboard by credits
+  leaderboard.sort((a, b) => {
+      // If both credits are 'Infinity' or '-Infinity', we want to keep their positions as is
+      if (a.credits === Infinity && b.credits === Infinity) return 0;
+      if (a.credits === -Infinity && b.credits === -Infinity) return 0;
+      if (a.credits === Infinity) return -1; // Place 'Infinity' credits at the top
+      if (b.credits === Infinity) return 1;
+      if (a.credits === -Infinity) return 1; // Place '-Infinity' credits at the bottom
+      if (b.credits === -Infinity) return -1;
+      
+      return b.credits - a.credits; // Regular sorting for other values
+  });
+
+  // Generate the report
+  const embed = new EmbedBuilder()
+      .setTitle("💰 Economy Report 💰")
+      .setColor("#00ff00")
+      .addFields(
+          { name: "Total Credits", value: `${formatCredits(totalCredits)} credits`, inline: true },
+          { name: "Total Debt", value: `${formatCredits(totalDebt)} credits`, inline: true },
+          { name: "Leaderboard", value: leaderboard.slice(0, 10).map((entry, index) => {
+              // Use '∞' for Infinity and '-∞' for -Infinity
+              const creditsDisplay = entry.credits === Infinity ? "∞" : entry.credits === -Infinity ? "-∞" : formatCredits(entry.credits);
+              return `${index + 1}. <@${entry.userId}>: ${creditsDisplay} credits`;
+          }).join('\n') || "No data" }
+      )
+      .setTimestamp();
+
+  return embed;
+}
+
+client.on('messageCreate', async message => {  // Add `async` here
+    if (!message.content.startsWith('!') || message.author.bot) return;
+
+    const args = message.content.slice(1).trim().split(/ +/);
+    const command = args.shift().toLowerCase();
+    const userId = message.author.id;
+    const ownerRole = '1322814000328609833'; // Owner Role ID
+    const staffRole = '1322814000303575048'; // Staff Role ID
+
+    // !spin command logic (existing)
+    if (command === 'sac') {
+        const amount = parseInt(args[0]);
+    
+        if (isNaN(amount) || amount <= 0) {
+            return message.reply("Please specify a valid amount of credits to sacrifice.");
+        }
+    
+        if (!creditsData[userId] || creditsData[userId].credits < amount) {
+            return message.reply("You do not have enough credits to sacrifice this amount.");
+        }
+    
+        const sacMultiplier = 0.01; // 0.01 increase per 1k credits
+        const sacIncrement = Math.floor(amount / 100000) * sacMultiplier; // Calculate how much luck increases
+        const spinBoostDuration = 10; // Number of spins the boost lasts
+    
+        if (sacIncrement <= 0) {
+            return message.reply("You need to sacrifice at least 100000 credits.");
+        }
+    
+        // Deduct the credits
+        creditsData[userId].credits -= amount;
+        saveCredits();
+    
+        // Apply server-wide spin luck boost
+        if (!creditsData.spinLuck) {
+            creditsData.spinLuck = { bonus: 0, remainingSpins: 0 };
+        }
+    
+        creditsData.spinLuck.bonus += sacIncrement;
+        creditsData.spinLuck.remainingSpins += spinBoostDuration;
+        saveCredits();
+    
+        message.channel.send(`🔮 **${message.author.username}** has sacrificed **${formatCredits(amount)}** credits! 
+    The next **${spinBoostDuration}** server-wide spins will have an increased luck of **+${sacIncrement.toFixed(2)}**.`);
+    }    
+    
+    // UNSAC command for owner to stop current luck boost
+    if (command === 'unsac') {
+        if (!message.member.roles.cache.has(ownerRole)) {
+            return message.reply("Only the server owner can use this command.");
+        }
+    
+        if (!creditsData.spinLuck || creditsData.spinLuck.bonus <= 0) {
+            return message.reply("There is no active luck boost to remove.");
+        }
+    
+        creditsData.spinLuck.bonus = 0;
+        creditsData.spinLuck.remainingSpins = 0;
+        saveCredits();
+    
+        message.channel.send("🔮 The server-wide luck boost has been reset by the owner.");
+    }
+    
+    // Modify spin command to apply the boost
+    if (command === 'spin') {
+        const allowedChannelId = '1322814001226452996';
+        const isOwner = message.member.roles.cache.has(ownerRole);
+    
+        if (message.channel.id !== allowedChannelId && !isOwner) {
+            return
+        }
+    
+        const now = Date.now();
+        const cooldown = 300000; // 5 minutes in milliseconds
+
+        if (!isOwner && spinCooldowns[userId] && now - spinCooldowns[userId] < cooldown) {
+            const remainingTime = cooldown - (now - spinCooldowns[userId]);
+            const minutes = Math.floor(remainingTime / 60000);
+            return message.reply(`You must wait ${minutes} minutes before spinning again.`);
+        }
+    
+        spinCooldowns[userId] = now;
+    
+        // Apply the sacrifice boost if available
+        let luckBonus = 0;
+        if (creditsData.spinLuck && creditsData.spinLuck.remainingSpins > 0) {
+            luckBonus = (creditsData[userId]?.credits / 100000) * 0.01; // 0.01 per 100000 credits
+            creditsData.spinLuck.remainingSpins -= 1;
+            if (creditsData.spinLuck.remainingSpins <= 0) {
+                creditsData.spinLuck.bonus = 0; // Reset the boost after it's used up
+            }
+            saveCredits();
+        }
+    
+        const rarities = [
+            // Area 1 (100 increment)
+            { name: "🍂 Withered Leaf", probability: 0.90, minReward: 10, maxReward: 50 },
+            { name: "🍁 Fallen Petal", probability: 0.79, minReward: 51, maxReward: 100 },
+            { name: "🍃 Gentle Breeze", probability: 0.78, minReward: 110, maxReward: 200 },
+            { name: "🍂 Dried Twig", probability: 0.77, minReward: 210, maxReward: 300 },
+            { name: "🍁 Autumn's Kiss", probability: 0.76, minReward: 310, maxReward: 400 },
+            { name: "🌿 Verdant Leaf", probability: 0.75, minReward: 410, maxReward: 500 },
+            { name: "🍃 Sprout's Hope", probability: 0.74, minReward: 510, maxReward: 600 },
+            { name: "🌱 Green Dream", probability: 0.73, minReward: 610, maxReward: 700 },
+            { name: "🌾 Golden Grain", probability: 0.72, minReward: 710, maxReward: 800 },
+            { name: "🌾 Rich Harvest", probability: 0.71, minReward: 810, maxReward: 900 },
+        
+            // Area 2 (1,000 increment)
+            { name: "🌸 Spring Bloom", probability: 0.50, minReward: 1_100, maxReward: 2_000 },
+            { name: "🌼 Sunshine Petal", probability: 0.49, minReward: 2_100, maxReward: 3_000 },
+            { name: "🌺 Rose's Embrace", probability: 0.48, minReward: 3_100, maxReward: 4_000 },
+            { name: "🌻 Eternal Sunshine", probability: 0.47, minReward: 4_100, maxReward: 5_000 },
+            { name: "🌷 Twilight Blossom", probability: 0.46, minReward: 5_100, maxReward: 6_000 },
+            { name: "💐 Radiant Bouquet", probability: 0.45, minReward: 6_100, maxReward: 7_000 },
+            { name: "🌼 Golden Sunbeam", probability: 0.44, minReward: 7_100, maxReward: 8_000 },
+            { name: "🌸 Serene Whisper", probability: 0.43, minReward: 8_100, maxReward: 9_000 },
+            { name: "🌿 Soothing Breeze", probability: 0.42, minReward: 9_100, maxReward: 10_000 },
+            { name: "🍃 Pure Essence", probability: 0.41, minReward: 10_100, maxReward: 11_000 },
+        
+            // Area 3 (10,000 increment)
+            { name: "💎 Shimmering Crystal", probability: 0.20, minReward: 11_100, maxReward: 21_000 },
+            { name: "✨ Glimmering Star", probability: 0.18, minReward: 21_100, maxReward: 31_000 },
+            { name: "🔮 Mystic Orb", probability: 0.16, minReward: 31_100, maxReward: 41_000 },
+            { name: "💠 Sparkling Diamond", probability: 0.15, minReward: 41_100, maxReward: 51_000 },
+            { name: "💫 Cosmic Starlight", probability: 0.13, minReward: 51_100, maxReward: 61_000 },
+            { name: "🌠 Celestial Glow", probability: 0.11, minReward: 61_100, maxReward: 71_000 },
+            { name: "🌌 Galactic Whisper", probability: 0.09, minReward: 71_100, maxReward: 81_000 },
+            { name: "🌟 Stellar Gift", probability: 0.07, minReward: 81_100, maxReward: 91_000 },
+            { name: "🌙 Lunar Touch", probability: 0.05, minReward: 91_100, maxReward: 101_000 },
+            { name: "🌑 Eclipse Heart", probability: 0.03, minReward: 101_100, maxReward: 111_000 },
+        
+            // Area 4 (50,000 increment)
+            { name: "💫 Radiant Light", probability: 0.01, minReward: 111_100, maxReward: 161_000 },
+            { name: "⚡ Thunderstrike Soul", probability: 0.08, minReward: 161_100, maxReward: 211_000 },
+            { name: "🌌 Nebula Heart", probability: 0.06, minReward: 211_100, maxReward: 261_000 },
+            { name: "🚀 Starborn Phoenix", probability: 0.04, minReward: 261_100, maxReward: 311_000 },
+            { name: "🌠 Shooting Star", probability: 0.02, minReward: 311_100, maxReward: 361_000 },
+        
+            // Area 5 (90,000 increment)
+            { name: "🌙 Moonlit Veil", probability: 0.009, minReward: 361_100, maxReward: 451_000 },
+            { name: "⭐ Celestial Flame", probability: 0.007, minReward: 451_100, maxReward: 541_000 },
+            { name: "🌑 Dark Nebula", probability: 0.005, minReward: 541_100, maxReward: 631_000 },
+            { name: "⚡ Tempest Fury", probability: 0.003, minReward: 631_100, maxReward: 721_000 },
+            { name: "🚀 Interstellar Shift", probability: 0.001, minReward: 721_100, maxReward: 811_000 },
+        
+            // Area 6 (170,000 increment)
+            { name: "🌌 Stellar Surge", probability: 0.0009, minReward: 811_100, maxReward: 981_000 },
+            { name: "🌠 Astral Rebirth", probability: 0.0007, minReward: 981_100, maxReward: 1_151_000 },
+            { name: "🌙 Eternal Twilight", probability: 0.0005, minReward: 1_151_100, maxReward: 1_321_000 },
+            { name: "🌟 Starry Dream", probability: 0.0003, minReward: 1_321_100, maxReward: 1_491_000 },
+            { name: "💫 Radiant Light", probability: 0.0001, minReward: 1_491_100, maxReward: 1_661_000 },
+        
+            // Area 7 (250,000 increment)
+            { name: "⚡ Thunderous Gale", probability: 0.00009, minReward: 1_661_100, maxReward: 1_911_000 },
+            { name: "🌑 Black Hole's Embrace", probability: 0.00007, minReward: 1_911_100, maxReward: 2_161_000 },
+            { name: "🌌 Cosmic Rift", probability: 0.00005, minReward: 2_161_100, maxReward: 2_411_000 },
+            { name: "🚀 Stellar Eclipse", probability: 0.00003, minReward: 2_411_100, maxReward: 2_661_000 },
+            { name: "✨ Celestial Whirlwind", probability: 0.00001, minReward: 2_661_100, maxReward: 2_911_000 },
+        
+            // Area 8 (400,000 increment)
+            { name: "🌠 Star's Wrath", probability: 0.000009, minReward: 2_911_100, maxReward: 3_311_000 },
+            { name: "⚡ Vortex Storm", probability: 0.000007, minReward: 3_311_100, maxReward: 3_711_000 },
+            { name: "🚀 Solar Flare", probability: 0.000005, minReward: 3_711_100, maxReward: 4_111_000 },
+            { name: "🌌 Quantum Burst", probability: 0.000003, minReward: 4_111_100, maxReward: 4_511_000 },
+            { name: "🌟 Cosmic Cataclysm", probability: 0.000001, minReward: 4_511_100, maxReward: 4_911_000 },
+        
+            // Area 9 (600,000 increment)
+            { name: "🌙 Lunaris Requiem", probability: 0.0000009, minReward: 4_911_100, maxReward: 5_511_000 },
+            { name: "⚡ Solar Storm", probability: 0.0000007, minReward: 5_511_100, maxReward: 6_111_000 },
+            { name: "🌌 Galactic Nova", probability: 0.0000005, minReward: 6_111_100, maxReward: 6_711_000 },
+        
+            // Area 10 (1.5 million increment)
+            { name: "⚡ Stormborn AERIE", probability: 0.0000001, minReward: 6_711_100, maxReward: 8_211_000 },
+            { name: "✨ Radiant ESSENCE", probability: 0.00000006, minReward: 8_211_100, maxReward: 9_711_000 },
+            { name: "🚀 Astral SPIRIT", probability: 0.00000003, minReward: 9_711_100, maxReward: 11_211_000 },
+            { name: "🍞BREAD", probability: 0.0000000000000001, minReward: 100_000_000, maxReward: 1_000_000_000 }
+        ];
+        //🚀 Astral SPIRIT ✨ Radiant ESSENCE ⚡ Stormborn AERIEz
+    
+        // Exclude these rarities from the luck boost
+        const excludedRarities = [
+            "🍂 Withered Leaf",
+            "🍁 Fallen Petal",
+            "🍃 Gentle Breeze",
+            "🍂 Dried Twig",
+            "🍁 Autumn's Kiss"
+        ];
+    
+        // Calculate total probability first
+        let totalProbability = rarities.reduce((sum, r) => sum + r.probability, 0);
+    
+        // Apply luck bonus only to boostable rarities
+        rarities.forEach(r => {
+            if (!excludedRarities.includes(r.name)) {
+                r.probability += (r.probability / totalProbability) * luckBonus;
+            }
+        });
+    
+        // Normalize probabilities to ensure they sum to 1
+        totalProbability = rarities.reduce((sum, r) => sum + r.probability, 0);
+        rarities.forEach(r => r.probability /= totalProbability);
+    
+        // Select a rarity
+        let roll = Math.random();
+        let selectedRarity = rarities.find(rarity => {
+            roll -= rarity.probability;
+            return roll <= 0;
+        }) || rarities[rarities.length - 1];
+    
+        // Give credits based on rarity
+        let reward = Math.floor(Math.random() * (selectedRarity.maxReward - selectedRarity.minReward + 1)) + selectedRarity.minReward;
+    
+        creditsData[userId] = creditsData[userId] || { credits: 0 };
+        creditsData[userId].credits += reward;
+        saveCredits();
+    
+        const embed = new EmbedBuilder()
+            .setTitle("🎰 Spin Results! 🎰")
+            .setDescription(`**${message.author.username}**, you won **${formatCredits(reward)}** credits! 🎉\nRarity: **${selectedRarity.name}**\nServer Luck: **${creditsData.spinLuck.bonus.toFixed(2)}**`)
+            .setColor("#00ff00");
+    
+        message.channel.send({ embeds: [embed] });
+    }    
+    
+
+    if (command === 'reset') {
+        if (!message.member.roles.cache.has(ownerRole)) {
+            return message.reply("You do not have permission to use this command.");
+        }
+
+        // Reset everyone's credits to 1
+        for (const userId in creditsData) {
+            creditsData[userId].credits = 1;
+        }
+        
+        saveCredits();
+        message.channel.send("All users' credits have been reset to 1.");
+    }
+
+    // Drop command logic (fix this as well)
+    if (command === 'drop') {
+        if (!message.member.roles.cache.has(ownerRole)) {
+            return message.reply("You must have the **Owner** role to use this command.");
+        }
+
+        const amount = parseInt(args[0]);
+        if (isNaN(amount) || amount === 0) {
+            return message.reply("Please specify a valid (positive or negative) amount of credits to drop.");
+        }
+
+        // Send a message notifying users of the drop and asking them to claim
+        const dropMessage = await message.channel.send({
+            content: `🎉 **${message.author.username}** dropped **${formatCredits(amount)}** credits! Type "claim" to receive them.`
+        });
+
+        // Wait for a user to claim
+        const filter = response => response.content.toLowerCase() === 'claim' && !response.author.bot;
+        const collector = message.channel.createMessageCollector({ filter, time: 60000 }); // 1 minute to claim
+
+        collector.on('collect', async (claimMessage) => {
+            const claimUser = claimMessage.author;
+
+            // Ensure user exists in the credit system
+            creditsData[claimUser.id] = creditsData[claimUser.id] || { credits: 0 };
+
+            // Apply the credit change (add if positive, deduct if negative)
+            creditsData[claimUser.id].credits += amount;
+            saveCredits();
+
+            // Notify the user that they claimed (or lost) the credits
+            const embed = new EmbedBuilder()
+                .setTitle("🎉 Credits Claimed! 🎉")
+                .setDescription(`**${claimUser.username}**, you ${amount > 0 ? 'claimed' : 'lost'} **${formatCredits(Math.abs(amount))}** credits! 🎉`)
+                .setColor(amount > 0 ? "#00ff00" : "#ff0000");
+
+            claimMessage.channel.send({ embeds: [embed] });
+
+            // Stop the collector after a claim
+            collector.stop();
+        });
+
+        collector.on('end', (collected, reason) => {
+            if (reason === 'time') {
+                // If no one claimed the credits within the time limit
+                dropMessage.edit({ content: `**${message.author.username}** dropped **${formatCredits(amount)}** credits! Unfortunately, no one claimed them in time.` });
+            }
+        });
+    }
+    if (command === 'pay') {
+  // Ensure the user specifies a recipient and an amount
+  if (args.length < 2) {
+      return message.reply("Usage: `!pay <user> <amount>`");
+  }
+
+  const recipientUser = message.mentions.users.first();
+  if (!recipientUser) {
+      return message.reply("Please mention a valid user to send credits to.");
+  }
+
+  const amount = parseInt(args[1]);
+  if (isNaN(amount) || amount <= 0) {
+      return message.reply("Please specify a valid amount of credits to send.");
+  }
+
+  // Check if the sender has enough credits
+  if (creditsData[userId].credits < amount) {
+      return message.reply("You don't have enough credits to make this payment.");
+  }
+
+  // Calculate the tax (10%) and deduct it from the sender
+  const taxAmount = Math.floor(amount * 0.1);
+  const totalAmountToDeduct = amount + taxAmount;  // The sender will lose both the amount and tax
+
+  // Check if the sender has enough credits after tax deduction
+  if (creditsData[userId].credits < totalAmountToDeduct) {
+      return message.reply("You don't have enough credits after the tax to make this payment.");
+  }
+
+  // Deduct the total amount (amount + tax) from the sender
+  creditsData[userId].credits -= totalAmountToDeduct;
+
+  // Send the amount (without tax) to the recipient
+  creditsData[recipientUser.id] = creditsData[recipientUser.id] || { credits: 0 };
+  creditsData[recipientUser.id].credits += amount;
+
+  // Save the updated credit data
+  saveCredits();
+
+  // Notify both users about the transaction
+  const embed = new EmbedBuilder()
+      .setTitle("💸 Payment Made! 💸")
+      .setDescription(`**${message.author.username}** sent **${formatCredits(amount)}** credits to **${recipientUser.username}**. A 10% tax of **${formatCredits(taxAmount)}** was deducted from the sender.`)
+      .setColor("#00ff00");
+
+  message.channel.send({ embeds: [embed] });
+}
+
+    // !leaderboard command for everyone
+    if (command === 'leaderboard') {
+        const leaderboard = Object.entries(creditsData)
+            .map(([userId, data]) => ({ userId, credits: data.credits || 0 }))
+            .sort((a, b) => b.credits - a.credits);
+
+        const leaderboardText = leaderboard
+            .slice(0, 10) // Display top 10 players
+            .map((entry, index) => `${index + 1}. <@${entry.userId}>: ${formatCredits(entry.credits)} credits`)
+            .join('\n');
+
+        const embed = new EmbedBuilder()
+            .setTitle("Leaderboard 🏆")
+            .setDescription(leaderboardText || "No data available.")
+            .setColor("#ffcc00");
+
+        message.channel.send({ embeds: [embed] });
+    }
+
+    if (command === 'bottomleaderboard') {
+      const leaderboard = Object.entries(creditsData)
+          .map(([userId, data]) => ({ userId, credits: data.credits || 0 }))
+          .sort((a, b) => a.credits - b.credits); // Sort ascending by credits
+  
+      const leaderboardText = leaderboard
+          .slice(0, 10) // Display bottom 10 players
+          .map((entry, index) => `${index + 1}. <@${entry.userId}>: ${formatCredits(entry.credits)} credits`)
+          .join('\n');
+  
+      const embed = new EmbedBuilder()
+          .setTitle("Bottom Leaderboard 📉")
+          .setDescription(leaderboardText || "No data available.")
+          .setColor("#ff0000");
+  
+      message.channel.send({ embeds: [embed] });
+  }
+  if (command === 'economy') {
+    const economyReportEmbed = generateEconomyReport();  // Generate the economy report embed
+    message.channel.send({ embeds: [economyReportEmbed] });
+}
+  if (command === 'credits') {
+    const userCredits = creditsData[userId]?.credits || 0; // Get the user's credits or default to 0 if not found
+
+    const embed = new EmbedBuilder()
+        .setTitle("💸 Your Credits 💸")
+        .setDescription(`**${message.author.username}**, you currently have **${formatCredits(userCredits)}** credits!`)
+        .setColor("#00ff00")
+        .setTimestamp();
+
+    message.channel.send({ embeds: [embed] });
+}
+    if (command === 'setcredits') {
+      if (!message.member.roles.cache.has(ownerRole)) {
+          return message.reply("Only the **Owner** role can use this command.");
+      }
+  
+      const target = message.mentions.users.first();
+      const amount = parseInt(args[1]);
+  
+      if (!target || isNaN(amount)) {
+          return message.reply("Usage: `!setcredits <@user> <amount>` where amount can be positive or negative.");
+      }
+  
+      creditsData[target.id] = { credits: amount };  // Set credits to the specified amount (negative or positive)
+      saveCredits();
+  
+      message.reply(`Successfully set **${target.username}**'s credits to **${formatCredits(amount)}**.`);
+  }
+    if (command === 'addcredits') {
+        if (!message.member.roles.cache.has(ownerRole)) {
+            return message.reply("Only the **Owner** role can use this command.");
+        }
+        const target = message.mentions.users.first();
+        const amount = parseInt(args[1]);
+
+        if (!target || isNaN(amount) || amount < 0) {
+            return message.reply("Usage: `!addcredits <@user> <amount>`");
+        }
+
+        creditsData[target.id] = creditsData[target.id] || { credits: 0 };
+        creditsData[target.id].credits += amount;
+        saveCredits();
+
+        message.reply(`Successfully added **${formatCredits(amount)}** credits to **${target.username}**.`);
+    }
+
+    if (command === 'removecredits') {
+        if (!message.member.roles.cache.has(ownerRole)) {
+            return message.reply("Only the **Owner** role can use this command.");
+        }
+        const target = message.mentions.users.first();
+        const amount = parseInt(args[1]);
+
+        if (!target || isNaN(amount) || amount < 0) {
+            return message.reply("Usage: `!removecredits <@user> <amount>`");
+        }
+
+        creditsData[target.id] = creditsData[target.id] || { credits: 0 };
+        creditsData[target.id].credits -= amount;
+        saveCredits();
+
+        message.reply(`Successfully removed **${formatCredits(amount)}** credits from **${target.username}**.`);
+    }
+
+    if (command === 'giveinf') {
+      if (!message.member.roles.cache.has(ownerRole)) {
+          return message.reply("Only the **Owner** role can use this command.");
+      }
+  
+      // Get the mentioned user
+      const target = message.mentions.users.first();
+      if (!target) {
+          return message.reply("Please mention a user to give infinite credits.");
+      }
+  
+      // Set the mentioned user's credits to Infinity
+      creditsData[target.id] = { credits: Infinity };
+      saveCredits();
+  
+      message.reply(`Successfully gave **infinite credits** to **${target.username}**.`);
+  }  
+  if (command === 'give-inf') {
+    if (!message.member.roles.cache.has(ownerRole)) {
+        return message.reply("Only the **Owner** role can use this command.");
+    }
+
+    // Get the mentioned user
+    const target = message.mentions.users.first();
+    if (!target) {
+        return message.reply("Please mention a user to give negative infinite credits.");
+    }
+
+    // Set the mentioned user's credits to Negative Infinity
+    creditsData[target.id] = { credits: -Infinity };
+    saveCredits();
+
+    message.reply(`Successfully gave **negative infinite credits** to **${target.username}**.`);
+}
+if (command === 'spinar') {
+    const isOwner = message.member.roles.cache.has(ownerRole);
+
+    if (!isOwner) {
+        return message.reply("You do not have the required permissions to use this command.");
+    }
+
+    const rarities = [
+        // Area 1 (100 increment)
+        { name: "🍂 Withered Leaf", probability: 0.90, minReward: 10, maxReward: 50 },
+        { name: "🍁 Fallen Petal", probability: 0.79, minReward: 51, maxReward: 100 },
+        { name: "🍃 Gentle Breeze", probability: 0.78, minReward: 110, maxReward: 200 },
+        { name: "🍂 Dried Twig", probability: 0.77, minReward: 210, maxReward: 300 },
+        { name: "🍁 Autumn's Kiss", probability: 0.76, minReward: 310, maxReward: 400 },
+        { name: "🌿 Verdant Leaf", probability: 0.75, minReward: 410, maxReward: 500 },
+        { name: "🍃 Sprout's Hope", probability: 0.74, minReward: 510, maxReward: 600 },
+        { name: "🌱 Green Dream", probability: 0.73, minReward: 610, maxReward: 700 },
+        { name: "🌾 Golden Grain", probability: 0.72, minReward: 710, maxReward: 800 },
+        { name: "🌾 Rich Harvest", probability: 0.71, minReward: 810, maxReward: 900 },
+    
+        // Area 2 (1,000 increment)
+        { name: "🌸 Spring Bloom", probability: 0.50, minReward: 1_100, maxReward: 2_000 },
+        { name: "🌼 Sunshine Petal", probability: 0.49, minReward: 2_100, maxReward: 3_000 },
+        { name: "🌺 Rose's Embrace", probability: 0.48, minReward: 3_100, maxReward: 4_000 },
+        { name: "🌻 Eternal Sunshine", probability: 0.47, minReward: 4_100, maxReward: 5_000 },
+        { name: "🌷 Twilight Blossom", probability: 0.46, minReward: 5_100, maxReward: 6_000 },
+        { name: "💐 Radiant Bouquet", probability: 0.45, minReward: 6_100, maxReward: 7_000 },
+        { name: "🌼 Golden Sunbeam", probability: 0.44, minReward: 7_100, maxReward: 8_000 },
+        { name: "🌸 Serene Whisper", probability: 0.43, minReward: 8_100, maxReward: 9_000 },
+        { name: "🌿 Soothing Breeze", probability: 0.42, minReward: 9_100, maxReward: 10_000 },
+        { name: "🍃 Pure Essence", probability: 0.41, minReward: 10_100, maxReward: 11_000 },
+    
+        // Area 3 (10,000 increment)
+        { name: "💎 Shimmering Crystal", probability: 0.20, minReward: 11_100, maxReward: 21_000 },
+        { name: "✨ Glimmering Star", probability: 0.18, minReward: 21_100, maxReward: 31_000 },
+        { name: "🔮 Mystic Orb", probability: 0.16, minReward: 31_100, maxReward: 41_000 },
+        { name: "💠 Sparkling Diamond", probability: 0.15, minReward: 41_100, maxReward: 51_000 },
+        { name: "💫 Cosmic Starlight", probability: 0.13, minReward: 51_100, maxReward: 61_000 },
+        { name: "🌠 Celestial Glow", probability: 0.11, minReward: 61_100, maxReward: 71_000 },
+        { name: "🌌 Galactic Whisper", probability: 0.09, minReward: 71_100, maxReward: 81_000 },
+        { name: "🌟 Stellar Gift", probability: 0.07, minReward: 81_100, maxReward: 91_000 },
+        { name: "🌙 Lunar Touch", probability: 0.05, minReward: 91_100, maxReward: 101_000 },
+        { name: "🌑 Eclipse Heart", probability: 0.03, minReward: 101_100, maxReward: 111_000 },
+    
+        // Area 4 (50,000 increment)
+        { name: "💫 Radiant Light", probability: 0.01, minReward: 111_100, maxReward: 161_000 },
+        { name: "⚡ Thunderstrike Soul", probability: 0.08, minReward: 161_100, maxReward: 211_000 },
+        { name: "🌌 Nebula Heart", probability: 0.06, minReward: 211_100, maxReward: 261_000 },
+        { name: "🚀 Starborn Phoenix", probability: 0.04, minReward: 261_100, maxReward: 311_000 },
+        { name: "🌠 Shooting Star", probability: 0.02, minReward: 311_100, maxReward: 361_000 },
+    
+        // Area 5 (90,000 increment)
+        { name: "🌙 Moonlit Veil", probability: 0.009, minReward: 361_100, maxReward: 451_000 },
+        { name: "⭐ Celestial Flame", probability: 0.007, minReward: 451_100, maxReward: 541_000 },
+        { name: "🌑 Dark Nebula", probability: 0.005, minReward: 541_100, maxReward: 631_000 },
+        { name: "⚡ Tempest Fury", probability: 0.003, minReward: 631_100, maxReward: 721_000 },
+        { name: "🚀 Interstellar Shift", probability: 0.001, minReward: 721_100, maxReward: 811_000 },
+    
+        // Area 6 (170,000 increment)
+        { name: "🌌 Stellar Surge", probability: 0.0009, minReward: 811_100, maxReward: 981_000 },
+        { name: "🌠 Astral Rebirth", probability: 0.0007, minReward: 981_100, maxReward: 1_151_000 },
+        { name: "🌙 Eternal Twilight", probability: 0.0005, minReward: 1_151_100, maxReward: 1_321_000 },
+        { name: "🌟 Starry Dream", probability: 0.0003, minReward: 1_321_100, maxReward: 1_491_000 },
+        { name: "💫 Radiant Light", probability: 0.0001, minReward: 1_491_100, maxReward: 1_661_000 },
+    
+        // Area 7 (250,000 increment)
+        { name: "⚡ Thunderous Gale", probability: 0.00009, minReward: 1_661_100, maxReward: 1_911_000 },
+        { name: "🌑 Black Hole's Embrace", probability: 0.00007, minReward: 1_911_100, maxReward: 2_161_000 },
+        { name: "🌌 Cosmic Rift", probability: 0.00005, minReward: 2_161_100, maxReward: 2_411_000 },
+        { name: "🚀 Stellar Eclipse", probability: 0.00003, minReward: 2_411_100, maxReward: 2_661_000 },
+        { name: "✨ Celestial Whirlwind", probability: 0.00001, minReward: 2_661_100, maxReward: 2_911_000 },
+    
+        // Area 8 (400,000 increment)
+        { name: "🌠 Star's Wrath", probability: 0.000009, minReward: 2_911_100, maxReward: 3_311_000 },
+        { name: "⚡ Vortex Storm", probability: 0.000007, minReward: 3_311_100, maxReward: 3_711_000 },
+        { name: "🚀 Solar Flare", probability: 0.000005, minReward: 3_711_100, maxReward: 4_111_000 },
+        { name: "🌌 Quantum Burst", probability: 0.000003, minReward: 4_111_100, maxReward: 4_511_000 },
+        { name: "🌟 Cosmic Cataclysm", probability: 0.000001, minReward: 4_511_100, maxReward: 4_911_000 },
+    
+        // Area 9 (600,000 increment)
+        { name: "🌙 Lunaris Requiem", probability: 0.0000009, minReward: 4_911_100, maxReward: 5_511_000 },
+        { name: "⚡ Solar Storm", probability: 0.0000007, minReward: 5_511_100, maxReward: 6_111_000 },
+        { name: "🌌 Galactic Nova", probability: 0.0000005, minReward: 6_111_100, maxReward: 6_711_000 },
+    
+        // Area 10 (1.5 million increment)
+        { name: "⚡ Stormborn AERIE", probability: 0.0000001, minReward: 6_711_100, maxReward: 8_211_000 },
+        { name: "✨ Radiant ESSENCE", probability: 0.00000006, minReward: 8_211_100, maxReward: 9_711_000 },
+        { name: "🚀 Astral SPIRIT", probability: 0.00000003, minReward: 9_711_100, maxReward: 11_211_000 },
+        { name: "🍞BREAD", probability: 0.0000000000000001, minReward: 100_000_000, maxReward: 1_000_000_000 }
+    ];
+
+    if (args.length === 0 || !rarities.find(rarity => rarity.name === args.join(" "))) {
+        return message.reply(`Please provide a valid rarity name from the list:\n\n${rarities.map(rarity => rarity.name).join("\n")}`);
+    }
+
+    const selectedRarity = rarities.find(rarity => rarity.name === args.join(" "));
+
+    // Calculate the reward
+    let reward = Math.floor(Math.random() * (selectedRarity.maxReward - selectedRarity.minReward + 1)) + selectedRarity.minReward;
+
+    creditsData[userId] = creditsData[userId] || { credits: 0 };
+    creditsData[userId].credits += reward;
+    saveCredits();
+
+    const embed = new EmbedBuilder()
+        .setTitle("🎰 Spin Results! 🎰")
+        .setDescription(`**${message.author.username}**, you won **${formatCredits(reward)}** credits! 🎉\nRarity: **${selectedRarity.name}**`)
+        .setColor("#00ff00");
+
+    message.channel.send({ embeds: [embed] });
+
+    return;
+}
+});
+
+// Login with token from config.json
+client.login(token).then(() => {
+    console.log('Bot is logged in and running!');
+});
